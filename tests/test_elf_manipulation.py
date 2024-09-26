@@ -161,7 +161,7 @@ def test_ELF_small64(assertion):
               'Packing after reading elf64_small.out')
     # Packed file is identical :-)
     d = e.sh.readelf_display().encode('latin1')
-    assertion('6d4aa86afdbf612430cb699987bc22b9',
+    assertion('c497dd6a4e9aa54fb5f65ee3b8f9de3e',
               hashlib.md5(d).hexdigest(),
               'Display Section Headers (readelf, 64bit)')
     d = e.getsectionbyname('.symtab').readelf_display().encode('latin1')
@@ -234,7 +234,11 @@ def test_ELF_offset_to_sections(assertion):
     data = StrPatchwork(ELF().pack())
     data[88+20] = struct.pack("<I", 0x1000)
     ELF(data)
-    assertion([('error', ('Offset to end of section %d after end of file', 0), {})],
+    assertion([('error', ('Offset to end of section %d after end of file', 0), {}),
+                    ("error", ('Section offset overlap for ' + \
+                            "[                00000000 001000 00000000 0] " + \
+                            '[.text           00000034 000000 00000000 6]',), {})
+                ],
               log_history,
               'Section offset+size too far away (logs)')
     log_history = []

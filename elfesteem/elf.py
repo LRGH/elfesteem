@@ -42,7 +42,7 @@ class Shdr(CStructWithStrTable):
     strtab = property(lambda _: _.parent.shstrtab)
     format = property(lambda _: {
         32: "  [%(idx)2d] %(name17)-17s %(type_txt)-15s %(addr)08x %(offset)06x %(size)06x %(entsize)02x %(flags_txt)3s %(link)2d %(info)3d %(addralign)2d",
-        64: "  [%(idx)2d] %(name17)-17s %(type_txt)-15s  %(addr)016x  %(offset)08x\n       %(size)016x  %(entsize)016x %(flags_txt)3s      %(link)2d    %(info)2d    %(addralign)2d",
+        64: "  [%(idx)2d] %(name17)-17s %(type_txt)-15s  %(addr)016x  %(offset)08x  %(size)016x  %(entsize)016x %(flags_txt)3s      %(link)2d    %(info)2d    %(addralign)2d",
         }[_.wsize])
     name17 = property(lambda _: _.name[:17])
     idx = property(lambda _: _.parent.parent.shlist.index(_.parent))
@@ -242,6 +242,86 @@ class Dyn32(CStruct):
 class Dyn64(Dyn32):
     _fields = [ ("type","u64"),
                 ("name_idx","u64") ]
+
+
+class Verdef32(CStruct):
+    _fields = [ ("version","u16"),
+                ("flags","u16"),
+                ("ndx","u16"),
+                ("cnt","u16"),
+                ("hash","u32"),
+                ("aux","u32") ]
+
+class Verdef64(Verdef32):
+    _fields = [ ("version","u16"),
+                ("flags","u16"),
+                ("ndx","u16"),
+                ("cnt","u16"),
+                ("hash","u32"),
+                ("aux","u32"),
+                ("next","u32") ]
+
+class Verneed32(CStruct):
+    _fields = [ ("vn_version", "u16"),
+                ("vn_cnt", "u16"),
+                ("vn_file", "u32"),
+                ("vn_aux", "u32"),
+                ("vn_next", "u32")]
+    offset = None
+    element_size = 0x10
+
+    def next(self):
+        if not self.vn_next:
+            return None
+
+        return self.parent.elements[(self.offset + self.vn_next) // self.element_size]
+    next = property(next)
+    
+    
+    def aux(self):
+        if not self.vn_aux:
+            return None
+            
+        return self.parent.elements[(self.offset + self.vn_aux) // self.element_size]
+    aux = property(aux)
+
+class Verneed64(Verneed32):
+    _fields = [ ("vn_version", "u16"),
+                ("vn_cnt", "u16"),
+                ("vn_file", "u32"),
+                ("vn_aux", "u32"),
+                ("vn_next", "u32")]
+    element_size = 0x10
+
+
+class Vernaux32(CStruct):
+    _fields = [ ("vna_hash", "u32"),
+                ("vna_flags", "u16"),
+                ("vna_other", "u16"),
+                ("vna_name", "u32"),
+                ("vna_next", "u32")]
+    element_size = 0x10
+    offset = None
+
+    def next(self):
+        if not self.vna_next:
+            return None
+
+        return self.parent.elements[(self.offset + self.vna_next) // self.element_size]
+    next = property(next)
+
+    def name(self):
+        return self.parent.parent.parent.getsectionbyname(".dynstr").get_name(self.vna_name)
+    name = property(name)
+
+
+class Vernaux64(Vernaux32):
+    _fields = [ ("vna_hash", "u32"),
+                ("vna_flags", "u16"),
+                ("vna_other", "u16"),
+                ("vna_name", "u32"),
+                ("vna_next", "u32")]
+    element_size = 0x10
 
 
 SetConstants(

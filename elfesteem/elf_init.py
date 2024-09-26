@@ -1,10 +1,10 @@
 #! /usr/bin/env python
 
 import struct
+import logging
 
 from elfesteem import elf
 from elfesteem.strpatchwork import StrPatchwork
-import logging
 
 log = logging.getLogger("elfparse")
 console_handler = logging.StreamHandler()
@@ -13,6 +13,14 @@ log.addHandler(console_handler)
 log.setLevel(logging.WARN)
 
 
+
+def align_to(value, alignment):
+    trimed = value - (value & (alignment-1))
+    extra = 0
+    if (value & (alignment-1)):
+        extra = alignment
+
+    return trimed + extra
 
 ### Sections
 
@@ -36,6 +44,16 @@ class SectionMetaclass(type):
 SectionBase = SectionMetaclass('SectionBase', (object,), {})
 
 class Section(SectionBase):
+    '''
+    sht: (elf.SHT_*) Section header type
+    sh: (elf.Shdr) actual header
+    parent: (SHList) list of sections
+    phparents: (list[ProgramHeader]) all ProgramHeader's that fully contain this section
+    phparent: (ProgramHeader) _main_ ProgramHeader in witch this section resides
+                first encountered, prefering elf.PT_LOAD sections
+    content: (StrPatchwork) actual bytes of the section header
+    '''
+
     sht = None
     def create(cls, parent, shstr=None):
         if shstr is None:
@@ -52,11 +70,144 @@ wsize = parent.wsize)
         return i
     create = classmethod(create)
 
-    def resize(self, old, new):
-        self.sh.size += new-old
-        self.parent.resize(self, new-old)
+    def append_section_content(self, appended_section):
+        # type: (Section) -> None
+        old_size = self.size
+        self.resize(0, appended_section.size)
+
+        self.content[
+            old_size:
+            self.size
+        ] = appended_section.content.pack()
+
+    def next_section(self):
+        # type: () -> Union[Section, list[Section]]:
+        stacket = False
+        stack = []
+        latest = None
+        for section in self.parent.shlist:
+            if section.sh.offset <= self.sh.offset or section is self:
+                continue
+
+            if latest is None or section.sh.offset < latest.sh.offset:
+                latest = section
+                stacket = False
+                stack = [section]
+                continue
+
+            if section.sh.offset == latest.sh.offset:
+                stacket = True
+                stack.append(section)
+
+        if stacket:
+            return stack
+
+        return latest
+
+    def fix_allignment_requierments(self):
+        # local_logger = logging.getLogger("expand_sections")
+        # local_logger.setLevel(logging.DEBUG)
+
+        if self.sh.addralign == 0 or (self.addr % self.sh.addralign) == 0:
+            return
+
+        req = self.sh.addralign - (self.addr % self.sh.addralign)
+        og_offset = self.sh.offset
+
+        # local_logger.debug(f"offseting ({hex(self.addr)})[{self}]${self.sh.addralign} with {req}")
+        
+        self.sh.offset += req
+        if self.addr:
+            self.sh.addr += req
+
+        next_section = self.next_section()
+        if type(next_section) is list:
+            next_section = next_section[0]
+
+        if next_section is not None:
+            # local_logger.debug(f"\tfound next section [{next_section}]")
+            old_req = req
+            # local_logger.debug(f"{req=: x}, {next_section.sh.offset=: x}, {self.sh.offset=: x}, {self.size=: x}")
+            unused = next_section.sh.offset - (self.sh.offset + self.size)
+            # local_logger.debug(f"{unused=: x}")
+
+            if unused >= 0:
+                reuse = req
+                req = 0
+            else:
+                # unused < 0 aka h
+                reuse = abs(unused)
+                req += abs(unused)
+
+            # local_logger.debug(f"\trecovered {reuse}: [{old_req} -> {req}]")
+
+        if req == 0:
+            # local_logger.debug("\tpremature solve")
+            return
+
         if self.phparent:
-            self.phparent.resize(self, new-old)
+            # local_logger.debug(hex(self.phparent.addr), hex(self.phparent.ph.filesz), hex(self.phparent.ph.memsz))
+            self.phparent.resize(self, req)
+            for ph in self.phparents:
+                if ph is self.phparent:
+                    continue
+                if ph.ph.type == elf.PT_LOAD:
+                    continue
+
+                ph.resize(self, req)
+        else:
+            self.parent.move_after(self, req)
+
+    def resize(self, old, new):
+        # type: (int, int) -> None
+        # local_logger = logging.getLogger("expand_sections")
+        # local_logger.setLevel(logging.DEBUG)
+
+        og_size = self.sh.size
+        self.sh.size += new-old
+
+        diff = new - old
+        next_section = self.next_section()
+        if type(next_section) is list:
+            next_section = next_section[0]
+        if next_section is not None:
+            # take in to account existing space between this and the next section
+            # local_logger.debug("\tdiff , (next_section.sh.offset - self.sh.offset - self.size))")
+            # local_logger.debug("\t", next_section.sh.offset, self.sh.offset, og_size)
+            # local_logger.debug("\t", diff , (next_section.sh.offset - self.sh.offset - og_size))
+            diff = max(0, diff - (next_section.sh.offset - self.sh.offset - og_size))
+
+        # local_logger.debug("resize", self)
+        # local_logger.debug("next: ", next_section)
+        # local_logger.debug("\t", hex(new-old))
+        # local_logger.debug("\t", hex(diff))
+        if diff == 0:
+            for ph in self.phparents:
+                if self.sh.offset + self.size == ph.ph.filesz + ph.size:
+                    # only extend segments
+                    # ignore posible segment overlaps since it is guaranteed that no section will overlap
+                    ph.size += new-old
+            return
+
+        if self.phparent:
+            # local_logger.debug(hex(self.phparent.addr), hex(self.phparent.ph.filesz), hex(self.phparent.ph.memsz))
+            self.phparent.resize(self, diff)
+            for ph in self.phparents:
+                if ph is self.phparent:
+                    continue
+                if ph.ph.type == elf.PT_LOAD:
+                    continue
+                ph.resize(self, diff)
+        else:
+            self.parent.move_after(self, diff)
+        
+    def move(self, diff):
+        self.sh.offset += diff
+
+        if self.addr:
+            # don't change for unmaped sections
+            self.sh.addr += diff
+
     def parse_content(self):
         pass
     def pack(self):
@@ -90,6 +241,7 @@ wsize = parent.wsize)
     def __init__(self, parent, sh=None, **kargs):
         self.parent=parent
         self.phparent=None
+        self.phparents=[]
         inheritsexwsize(self, parent, {})
         if sh is None:
             sh = elf.Shdr(parent=self, type=self.sht, name_idx=0, **kargs)
@@ -97,6 +249,8 @@ wsize = parent.wsize)
         self.content=StrPatchwork()
     def __repr__(self):
         return "%(name)-15s %(offset)08x %(size)06x %(addr)08x %(flags)x" % self.sh
+    def recalc(self):
+        pass
     size = property(lambda _: _.sh.size)
     addr = property(lambda _: _.sh.addr)
     name = property(lambda _: _.sh.name)
@@ -173,9 +327,80 @@ class SymTabSHIndeces(Section):
 
 class GNUVerSym(Section):
     sht = elf.SHT_GNU_versym
+    entry_size = 2
+    def parse_content(self):
+        c = self.content
+        unpack_format = "H"
+        self.indexes = []
+        while len(c) >= self.entry_size:
+            self.indexes.append(struct.unpack("H", c[:self.entry_size])[0])
+            c = c[self.entry_size:]
+
+    def __getitem__(self, i):
+        return self.indexes[i]
+    def __setitem__(self, i, val):
+        self.indexes[i] = val
+        self.content[i * self.entry_size: i * self.entry_size + self.entry_size] = struct.pack("H", val)
+    def __len__(self):
+        return len(self.indexes)
+
 
 class GNUVerNeed(Section):
+    '''
+    elements: list[elf.Verneed64|elf.Vernaux64]
+    needs: list[elf.Verneed64]
+    auxs: list[elf.Vernaux64]
+    '''
     sht = elf.SHT_GNU_verneed
+    entry_size = -1
+    Verneed = None
+    Vernaux = None
+    
+
+    def parse_content(self):
+        self.Verneed = {64: elf.Verneed64, 32: elf.Verneed32}[self.wsize]
+        self.Vernaux = {64: elf.Vernaux64, 32: elf.Vernaux32}[self.wsize]
+        self.entry_size = {64: 0x10, 32: 0x10}[self.wsize]
+
+        aux_remaining_count = 0
+
+        unpack_format = "H"
+        self.elements = [None] * (len(self.content) // self.entry_size)
+        self.needs = []
+        self.auxs = []
+
+
+        c = self.content
+        while len(c) >= self.entry_size:
+            elem = self.Verneed(parent=self, content=c[:self.entry_size])
+            self.needs.append(elem)
+            elem.offset = len(self.content) - len(c)
+            self.elements[elem.offset // self.entry_size] = elem
+            c = c[elem.vn_next:]
+            if not elem.vn_next:
+                break
+        
+        # TODO: validate for multiple needs
+        for need in self.needs:
+            c = self.content[need.offset+need.vn_aux:]
+            while len(c) >= self.entry_size:
+                elem = self.Vernaux(parent=self, content=c[:self.entry_size])
+                self.auxs.append(elem)
+                elem.offset = len(self.content) - len(c)
+                self.elements[elem.offset // self.entry_size] = elem
+                c = c[elem.vna_next:]
+                if not elem.vna_next:
+                    break
+
+    def __getitem__(self, i):
+        return self.elements[i]
+    def __setitem__(self, i, val):
+        self.elements[i] = val
+        self.content[i * self.entry_size: i * self.entry_size + self.entry_size] = val.pack()
+        raise Exception("TODO")
+        # TODO: update in needs/auxs
+    def __len__(self):
+        return len(self.elements)
 
 class GNUVerDef(Section):
     sht = elf.SHT_GNU_verdef
@@ -223,6 +448,73 @@ class Dynamic(Section):
         if type(item) is str:
             return self.dynamic[item]
         return self.dyntab[item]
+    def __setitem__(self, item, val):
+        if not isinstance(val, elf.Dyn32):
+            raise ValueError("Cannot set Dynamic item to %r" % val)
+        if item >= len(self.dyntab):
+            self.dyntab.extend([None for i in range(item + 1 - len(self.dyntab))])
+        # TODO: completly remove old entry
+        self.dyntab[item] = val
+        if type(val.name) is str:
+            self.dynamic[val.name] = val
+        
+        self.content[item * self.sh.entsize] = val.pack()
+        # if val.info>>4 == elf.STB_LOCAL and item >= self.sh.info:
+        #     # One greater than the symbol table index of the last local symbol
+        #     self.sh.info = item+1
+    def get_with_type(self, target_type):
+        for dyn_entry in (self.dyntab):
+            if dyn_entry.type == target_type:
+                return dyn_entry
+        
+        return None
+    def update_wi(self, idx, new_val):
+        dyn_entry = self[idx]
+        dyn_entry.name_idx = self.parent.parent.getsectionbyname(".fini").addr
+        self[idx] = dyn_entry
+    def update_wt(self, target_type, new_val):
+        for i, dyn_entry in enumerate(self.dyntab):
+            if dyn_entry.type != target_type:
+                continue
+            dyn_entry.name_idx = new_val
+            self[i] = dyn_entry
+            break
+        else:
+            raise Exception("not found")
+    def recalc(self):
+        self.update_wt(elf.DT_FINI, self.parent.parent.getsectionbyname(".fini").addr)
+        self.update_wt(elf.DT_FINI_ARRAY, self.parent.parent.getsectionbyname(".fini_array").addr)
+        self.update_wt(elf.DT_FINI_ARRAYSZ, self.parent.parent.getsectionbyname(".fini_array").size)
+        self.update_wt(elf.DT_INIT_ARRAY, self.parent.parent.getsectionbyname(".init_array").addr)
+        self.update_wt(elf.DT_INIT_ARRAYSZ, self.parent.parent.getsectionbyname(".init_array").size)
+
+        # check for full-RELRO
+        # !!! this might not be up to spec 
+        if self.get_with_type(elf.DT_PLTGOT) is not None:
+            if (self.get_with_type(elf.DT_FLAGS) is not None and self.get_with_type(elf.DT_FLAGS).name_idx & elf.DF_BIND_NOW):
+                self.update_wt(elf.DT_PLTGOT, self.parent.parent.getsectionbyname(".got").addr)
+            else:
+                self.update_wt(elf.DT_PLTGOT, self.parent.parent.getsectionbyname(".got.plt").addr)
+        
+        if self.parent.parent.getsectionbyname(".rela.plt"):
+            self.update_wt(elf.DT_JMPREL, self.parent.parent.getsectionbyname(".rela.plt").addr)
+        
+        self.update_wt(elf.DT_SYMTAB, self.parent.parent.getsectionbyname(".dynsym").addr)
+        self.update_wt(elf.DT_STRTAB, self.parent.parent.getsectionbyname(".dynstr").addr)
+        self.update_wt(elf.DT_STRSZ, self.parent.parent.getsectionbyname(".dynstr").size)
+        self.update_wt(elf.DT_RELA, self.parent.parent.getsectionbyname(".rela.dyn").addr)
+        self.update_wt(elf.DT_RELASZ, self.parent.parent.getsectionbyname(".rela.dyn").size)
+
+        if self.parent.parent.getsectionbyname(".plt"):
+            self.update_wt(elf.DT_PLTRELSZ, self.parent.parent.getsectionbyname(".plt").size)
+
+        self.update_wt(elf.DT_VERSYM, self.parent.parent.getsectionbyname(".gnu.version").addr)
+        self.update_wt(elf.DT_VERNEED, self.parent.parent.getsectionbyname(".gnu.version_r").addr)
+        
+        for ph in self.parent.parent.ph:
+            if ph.ph.type == elf.PT_DYNAMIC:
+                ph.ph.offset = self.sh.offset
+                ph.ph.paddr = ph.ph.vaddr = self.sh.addr
 
 from elfesteem.cstruct import data_null, bytes_to_name, name_to_bytes
 
@@ -233,15 +525,24 @@ class StrTable(Section):
         n = self.content[idx:self.content.find(data_null, idx)]
         return bytes_to_name(n)
 
+    def find_name(self, name):
+        name = name_to_bytes(name)
+        if name + data_null in self.content:
+            return self.content.find(name+data_null)
+        
+        return None
+
     def add_name(self, name):
         name = name_to_bytes(name)
-        if data_null+name+data_null in self.content:
+        if name + data_null in self.content:
             return self.content.find(name)
+        
+        # TODO: check for unused space and reuse, aka 2 or more NULL bytes
         idx = len(self.content)
+
+        self.resize(0, len(name))
         self.content[idx] = name+data_null
-        for sh in self.parent.shlist:
-            if sh.sh.offset > self.sh.offset:
-                sh.sh.offset += len(name)+1
+
         return idx
 
     def mod_name(self, idx, name):
@@ -249,12 +550,17 @@ class StrTable(Section):
         n = self.content[idx:self.content.find(data_null, idx)]
         dif = len(name) - len(n)
         if dif != 0:
-            for sh in self.parent.shlist:
-                if sh.sh.name_idx > idx:
-                    sh.sh.name_idx += dif
-                if sh.sh.offset > self.sh.offset:
-                    sh.sh.offset += dif
+            raise ValueError("Didn't fit in str section")
         return idx
+    
+    def last_char(self):
+        pos = 0
+        for i, c in enumerate(self.content):
+            if c != data_null:
+                pos = i
+
+        return pos
+    last_char = property(last_char)
 
 class SymTable(Section):
     sht = elf.SHT_SYMTAB
@@ -310,13 +616,18 @@ class DynSymTable(SymTable):
 
 class RelTable(Section):
     sht = elf.SHT_REL
-    def parse_content(self):
+    def rel_type(self):
         if self.__class__.sht == elf.SHT_REL:
-            Rel = { 32: elf.Rel32,  64: elf.Rel64 }[self.wsize]
+            return { 32: elf.Rel32,  64: elf.Rel64 }[self.wsize]
         elif self.__class__.sht == elf.SHT_RELA:
-            Rel = { 32: elf.Rela32, 64: elf.Rela64 }[self.wsize]
-        if self.parent.parent.Ehdr.machine == elf.EM_MIPS and self.wsize == 64:
-            Rel = elf.Rel64MIPS
+            return { 32: elf.Rela32, 64: elf.Rela64 }[self.wsize]
+        elif self.parent.parent.Ehdr.machine == elf.EM_MIPS and self.wsize == 64:
+            return elf.Rel64MIPS
+        else:
+            raise Exception("unknown Rel")
+
+    def parse_content(self):
+        Rel = self.rel_type()
         c = self.content
         self.reltab=[]
         self.rel = {}
@@ -328,6 +639,16 @@ class RelTable(Section):
             rel = Rel(parent=self, content=s)
             self.reltab.append(rel)
             self.rel[rel.sym] = rel
+
+    def __setitem__(self,item,val):
+        if not isinstance(val, elf.RelBase):
+            raise ValueError("Cannot set RelTable item to %r"%val)
+        if item >= len(self.reltab):
+            self.reltab.extend([None for i in range(item+1-len(self.reltab))])
+        self.reltab[item] = val
+        self.rel[val.name] = val
+        self.content[item * self.sh.entsize] = val.pack()
+
     def readelf_display(self):
         ret = "Relocation section %r at offset 0x%x contains %d entries:" % (
             self.sh.name,
@@ -426,7 +747,7 @@ class SHList(object):
         if self.wsize == 32:
             rep.append( "  [Nr] Name              Type            Addr     Off    Size   ES Flg Lk Inf Al" )
         elif self.wsize == 64:
-            rep.extend(["  [Nr] Name              Type             Address           Offset","       Size              EntSize          Flags  Link  Info  Align"])
+            rep.extend(["  [Nr] Name              Type             Address           Offset    Size              EntSize          Flags  Link  Info  Align"])
         rep.extend([ _.sh.readelf_display() for _ in self ])
         rep.extend([ # Footer
 "Key to Flags:",
@@ -442,14 +763,47 @@ class SHList(object):
         for s in self.shlist:
             c += s.sh.pack()
         return c
-    def resize(self, sec, diff):
-        for s in self.shlist:
-            if s.sh.offset > sec.sh.offset:
-                s.sh.offset += diff
-        if self.parent.Ehdr.shoff > sec.sh.offset:
+
+    def move_after(self, sec, diff):
+        '''Only used when a resized section doesn't bellong to a segment
+
+        !!! Untested ?
+        '''
+
+        old_section_file_end = sec.sh.offset + sec.sh.size - diff
+        old_section_memory_end = sec.sh.addr + sec.sh.size - diff
+
+        reason_is_mapped = sec.sh.addr != 0
+        
+        for section in self.shlist:
+            # check if a section needs to be moved relative to only one addres?
+            checks = [
+                section.sh.offset > old_section_file_end,
+                section.addr > old_section_memory_end,
+            ]
+            if reason_is_mapped:
+                assert all(checks) or not any(checks)
+
+            # skip previous sections
+            if section.sh.offset < old_section_file_end:
+                continue
+
+            if section is sec:
+                continue
+
+            section.move(diff)
+
+
+        if old_section_file_end < self.parent.Ehdr.shoff:
             self.parent.Ehdr.shoff += diff
-        if self.parent.Ehdr.phoff > sec.sh.offset:
-            self.parent.Ehdr.phoff += diff
+
+
+        symbol_table = self.parent.getsectionbyname(".symtab")
+        if symbol_table and sec.addr:
+            for i, symbol in enumerate(symbol_table.symtab):
+                if symbol.value >= old_section_memory_end:
+                    symbol.value += diff
+                    symbol_table[i] = symbol
 
 class NoLinkSection(object):
     get_name = lambda s,i:None
@@ -480,12 +834,20 @@ class ProgramHeader(object):
             if s.sh.flags & elf.SHF_ALLOC:
                 if   (self.ph.vaddr <= s.sh.addr) and \
                      (s.sh.addr+s.sh.size <= ph_mem_end):
-                    s.phparent = self
+                    if not s.phparent:
+                        s.phparent = self
+                    elif s.phparent.ph.type != elf.PT_LOAD and self.ph.type == elf.PT_LOAD:
+                        s.phparent = self
+                    s.phparents.append(self)
                     self.shlist.append(s)
             else:
                 if   (self.ph.offset <= s.sh.offset) and \
                      (s.sh.offset+s.sh.size <= ph_file_end):
-                    s.phparent = self
+                    if not s.phparent:
+                        s.phparent = self
+                    elif s.phparent.ph.type != elf.PT_LOAD and self.ph.type == elf.PT_LOAD:
+                        s.phparent = self
+                    s.phparents.append(self)
                     self.shlist.append(s)
             if s in self.shlist:
                 continue
@@ -496,9 +858,67 @@ class ProgramHeader(object):
                 # Section end in Segment
                 self.shlist_partial.append(s)
     def resize(self, sec, diff):
+        # local_logger = logging.getLogger("expand_sections")
+        # local_logger.setLevel(logging.DEBUG)
+        # the ELF standard demand that p_vaddr % p_align == p_offset % p_align, 
+        # This requirements is designed such that it is possible to map the segments
+        # from the file into memory while still keeping the file size minimal
+        # (there is no need to insert padding into the file).
+        
+        old_size = max(self.ph.filesz, self.ph.memsz)
+        new_size = old_size + diff
+
         self.ph.filesz += diff
         self.ph.memsz += diff
-        self.parent.resize(sec, diff)
+
+        # update trailing sections address to avoid overlap
+        # local_logger.debug("LOCAL:")
+        for section in self.shlist:
+            # local_logger.debug(section)
+
+            if section.sh.addr and section.addr > sec.addr:
+                # local_logger.debug(f"Offseting section {section}")
+                section.sh.addr += diff
+
+            if section.sh.offset > sec.sh.offset:
+                # local_logger.debug(f"\tadd {section.sh.offset:x} {diff}")
+                section.sh.offset += diff
+                # local_logger.debug(f"\t{section.sh.offset:x}")
+
+        performed_segment_expansion = False
+
+        # TODO: remove hacky fix: self.ph.align > 0x30
+        if align_to(old_size, self.ph.align) != align_to(new_size, self.ph.align) and self.ph.align > 0x30:
+            # local_logger.debug(f"{old_size=:x}|{align_to(old_size, self.ph.align):x}")
+            # local_logger.debug(f"{new_size=:x}|{align_to(new_size, self.ph.align):x}")
+            # local_logger.debug("Offseting subsequent segments after {self.shlist}")
+            segment_diff = align_to(new_size, self.ph.align) - align_to(old_size, self.ph.align)
+            self.parent.move_after(sec, segment_diff, sec.sh.size - diff)
+            performed_segment_expansion = True
+        
+        # handled in move_after??
+        # yes but not properly, as a result of segment alignment
+        for section in self.shlist:
+            assert not sec.addr < section.addr < sec.addr + sec.size - diff
+            assert not sec.sh.offset < section.sh.offset < sec.sh.offset + sec.size - diff
+
+        if performed_segment_expansion:
+            return
+
+        self.parent.parent.Ehdr.shoff += diff
+        
+
+        # local_logger.debug("GLOBAL:")
+        for section in self.parent.parent.sh:
+            # local_logger.debug(section)
+            if section.phparent:
+                # local_logger.debug("\tskiping")
+                continue
+
+            if self.ph.offset < section.sh.offset:
+                # local_logger.debug(f"\toffseting {diff:x}")
+                section.move(diff)
+
     # get_rvaitem needs addr and size (same names as in the Shdr class)
     # Note that we should always have memsz >= filesz unless memsz == 0
     # Note that paddr is irrelevant for most OS
@@ -542,14 +962,57 @@ class PHList(object):
         for p in self.phlist:
             c += p.ph.pack()
         return c
-    def resize(self, sec, diff):
+    def move_after(self, sec, diff, old_section_size):
+        # local_logger = logging.getLogger("expand_sections")
+        # local_logger.setLevel(logging.DEBUG)
+
+        # this is called by a ProgramHeader after a Section has beed resized
+        # old_section_size = sec.sh.size - diff
+        # local_logger.debug(f"{hex(old_section_size)} = {hex(sec.sh.size)} - {hex(diff)}")
+
+        old_section_file_end = sec.sh.offset + old_section_size
+        old_section_memory_end = sec.sh.addr + old_section_size
+        # local_logger.debug("old_section_memory_end = sec.sh.addr + old_section_size")
+        # local_logger.debug(f"{hex(old_section_memory_end)} = {hex(sec.sh.addr)} + {hex(old_section_size)}")
+
         for p in self.phlist:
-            if p.ph.offset > sec.sh.offset:
-                p.ph.offset += diff
-            if p.ph.vaddr > sec.phparent.ph.vaddr+sec.sh.offset:
-                p.ph.vaddr += diff
-            if p.ph.paddr > sec.phparent.ph.paddr+sec.sh.offset:
-                p.ph.paddr += diff
+            # address changes are requiered ONLY if the previous segment overflows in to it
+            # is there an instant when a segment needs to be moved relative to only one addres?
+            checks = [
+                p.ph.offset > old_section_file_end,
+                p.ph.vaddr > old_section_memory_end,
+                p.ph.vaddr > old_section_memory_end
+            ]
+            assert all(checks) or not any(checks)
+
+            if p.ph.offset < old_section_file_end:
+                continue
+
+            p.ph.offset += diff
+            p.ph.vaddr += diff
+            p.ph.paddr += diff
+
+
+        for section in self.parent.sh:
+            if section.phparent is sec.phparent:
+                # skip sections in segment
+                continue
+
+            # check if a section needs to be moved relative to only one addres?
+            checks = [
+                p.ph.offset > old_section_file_end,
+                p.ph.vaddr > old_section_memory_end,
+                p.ph.vaddr > old_section_memory_end
+            ]
+            assert all(checks) or not any(checks)
+            # skip previous sections
+            if section.sh.offset < old_section_file_end:
+                continue
+
+            section.move(diff)
+
+        # the section header is at the end; so it's offset needs to be updated 
+        self.parent.Ehdr.shoff += diff
 
 
 class virt(object):
@@ -564,7 +1027,7 @@ class virt(object):
         total_len = item.stop - item.start
         start = item.start
         virt_item = []
-        while total_len:
+        while total_len > 0:
             s = self.parent.getsectionbyvad(start, section)
             if not s:
                 raise ValueError('unknown rva address! %x'%start)
@@ -898,7 +1361,30 @@ class ELF(object):
             elif self.sh[self.Ehdr.shstrndx].sh.type != elf.SHT_STRTAB:
                 raise ValueError("Section of index shstrndx is of type %d instead of %d"%(self.sh[self.Ehdr.shstrndx].sh.type, elf.SHT_STRTAB))
             elif self.sh[self.Ehdr.shstrndx].sh.name != '.shstrtab':
-                raise ValueError("Section of index shstrndx is of name '%s' instead of '%s'"%(self.sh[self.Ehdr.shstrndx].sh.name, '.shstrtab'))
+                raise ValueError("Section of index shstrndx[%d] is of name '%s' instead of '%s'"%(self.Ehdr.shstrndx, self.sh[self.Ehdr.shstrndx].sh.name, '.shstrtab'))
+
+        skipable_section_types = [
+        ]
+
+        for sh1 in self.sh:
+            # the section after BSS can overlap
+
+            for sh2 in self.sh:
+                if sh2.sh.type in skipable_section_types:
+                    continue
+
+                if sh1.sh.type != elf.SHT_NOBITS and sh2.sh.type != elf.SHT_NOBITS and \
+                        (sh1.sh.offset < sh2.sh.offset < sh1.sh.offset + sh1.size or \
+                         sh2.sh.offset < sh1.sh.offset < sh2.sh.offset + sh2.size):
+                    raise ValueError("Section offset overlap for [%r] [%r]" % (sh1, sh2))
+
+                if not sh1.addr or not sh2.addr:
+                    continue
+
+                if sh1.sh.flags & sh2.sh.flags & elf.SHF_ALLOC and \
+                        (sh1.addr < sh2.addr < sh1.addr + sh1.size or \
+                         sh2.addr < sh1.addr < sh2.addr + sh2.size):
+                    raise ValueError("Section address overlap for [%r] [%r]" % (sh1, sh2))
 
     def __str__(self):
         raise AttributeError("Use pack() instead of str()")
@@ -926,6 +1412,7 @@ class ELF(object):
                 return s
         sh = [ s for s in self.sh if s.addr <= ad < s.addr+s.size ]
         ph = [ s for s in self.ph if s.addr <= ad < s.addr+s.size ]
+
         if len(sh) == 1 and len(ph) == 1:
             # Executable returns a section and a PH
             if not sh[0] in ph[0].shlist:
