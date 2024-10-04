@@ -105,16 +105,15 @@ wsize = parent.wsize)
         return latest
 
     def fix_allignment_requierments(self):
-        # local_logger = logging.getLogger("expand_sections")
+        local_logger = logging.getLogger("expand_sections")
         # local_logger.setLevel(logging.DEBUG)
 
         if self.sh.addralign == 0 or (self.addr % self.sh.addralign) == 0:
             return
 
         req = self.sh.addralign - (self.addr % self.sh.addralign)
-        og_offset = self.sh.offset
 
-        # local_logger.debug(f"offseting ({hex(self.addr)})[{self}]${self.sh.addralign} with {req}")
+        local_logger.debug("offseting (%x)[%r]$%x with {%x}", self.addr, self, self.sh.addralign, req)
         
         self.sh.offset += req
         if self.addr:
@@ -125,11 +124,11 @@ wsize = parent.wsize)
             next_section = next_section[0]
 
         if next_section is not None:
-            # local_logger.debug(f"\tfound next section [{next_section}]")
+            local_logger.debug("\tfound next section [%r]", next_section)
             old_req = req
-            # local_logger.debug(f"{req=: x}, {next_section.sh.offset=: x}, {self.sh.offset=: x}, {self.size=: x}")
+            local_logger.debug("\treq= %x, next.offset= %x, self.offset= %x, self.size= %x", req, next_section.sh.offset, self.sh.offset, self.size)
             unused = next_section.sh.offset - (self.sh.offset + self.size)
-            # local_logger.debug(f"{unused=: x}")
+            local_logger.debug("\tunused= %x", unused)
 
             if unused >= 0:
                 reuse = req
@@ -139,14 +138,14 @@ wsize = parent.wsize)
                 reuse = abs(unused)
                 req += abs(unused)
 
-            # local_logger.debug(f"\trecovered {reuse}: [{old_req} -> {req}]")
+            local_logger.debug("\trecovered %x: [%x -> %x]", reuse, old_req, req)
 
         if req == 0:
-            # local_logger.debug("\tpremature solve")
+            local_logger.debug("\tpremature solve")
             return
 
         if self.phparent:
-            # local_logger.debug(hex(self.phparent.addr), hex(self.phparent.ph.filesz), hex(self.phparent.ph.memsz))
+            local_logger.debug("\t%x %x %x", self.phparent.addr, self.phparent.ph.filesz, self.phparent.ph.memsz)
             self.phparent.resize(self, req)
             for ph in self.phparents:
                 if ph is self.phparent:
@@ -160,7 +159,7 @@ wsize = parent.wsize)
 
     def resize(self, old, new):
         # type: (int, int) -> None
-        # local_logger = logging.getLogger("expand_sections")
+        local_logger = logging.getLogger("expand_sections")
         # local_logger.setLevel(logging.DEBUG)
 
         og_size = self.sh.size
@@ -172,15 +171,14 @@ wsize = parent.wsize)
             next_section = next_section[0]
         if next_section is not None:
             # take in to account existing space between this and the next section
-            # local_logger.debug("\tdiff , (next_section.sh.offset - self.sh.offset - self.size))")
-            # local_logger.debug("\t", next_section.sh.offset, self.sh.offset, og_size)
-            # local_logger.debug("\t", diff , (next_section.sh.offset - self.sh.offset - og_size))
+            local_logger.debug("\t %x %x", diff , next_section.sh.offset - self.sh.offset - self.size)
+            local_logger.debug("\t %x %x %x", next_section.sh.offset, self.sh.offset, og_size)
             diff = max(0, diff - (next_section.sh.offset - self.sh.offset - og_size))
 
-        # local_logger.debug("resize", self)
-        # local_logger.debug("next: ", next_section)
-        # local_logger.debug("\t", hex(new-old))
-        # local_logger.debug("\t", hex(diff))
+        local_logger.debug("\tresize %r", self)
+        local_logger.debug("\tnext: %r", next_section)
+        local_logger.debug("\t %x", new-old)
+        local_logger.debug("\t %x", diff)
         if diff == 0:
             for ph in self.phparents:
                 if self.sh.offset + self.size == ph.ph.filesz + ph.size:
@@ -190,7 +188,7 @@ wsize = parent.wsize)
             return
 
         if self.phparent:
-            # local_logger.debug(hex(self.phparent.addr), hex(self.phparent.ph.filesz), hex(self.phparent.ph.memsz))
+            local_logger.debug("%x %x %x", self.phparent.addr, self.phparent.ph.filesz, self.phparent.ph.memsz)
             self.phparent.resize(self, diff)
             for ph in self.phparents:
                 if ph is self.phparent:
@@ -330,7 +328,6 @@ class GNUVerSym(Section):
     entry_size = 2
     def parse_content(self):
         c = self.content
-        unpack_format = "H"
         self.indexes = []
         while len(c) >= self.entry_size:
             self.indexes.append(struct.unpack("H", c[:self.entry_size])[0])
@@ -362,9 +359,6 @@ class GNUVerNeed(Section):
         self.Vernaux = {64: elf.Vernaux64, 32: elf.Vernaux32}[self.wsize]
         self.entry_size = {64: 0x10, 32: 0x10}[self.wsize]
 
-        aux_remaining_count = 0
-
-        unpack_format = "H"
         self.elements = [None] * (len(self.content) // self.entry_size)
         self.needs = []
         self.auxs = []
@@ -459,9 +453,7 @@ class Dynamic(Section):
             self.dynamic[val.name] = val
         
         self.content[item * self.sh.entsize] = val.pack()
-        # if val.info>>4 == elf.STB_LOCAL and item >= self.sh.info:
-        #     # One greater than the symbol table index of the last local symbol
-        #     self.sh.info = item+1
+
     def get_with_type(self, target_type):
         for dyn_entry in (self.dyntab):
             if dyn_entry.type == target_type:
@@ -858,7 +850,7 @@ class ProgramHeader(object):
                 # Section end in Segment
                 self.shlist_partial.append(s)
     def resize(self, sec, diff):
-        # local_logger = logging.getLogger("expand_sections")
+        local_logger = logging.getLogger("expand_sections")
         # local_logger.setLevel(logging.DEBUG)
         # the ELF standard demand that p_vaddr % p_align == p_offset % p_align, 
         # This requirements is designed such that it is possible to map the segments
@@ -872,26 +864,26 @@ class ProgramHeader(object):
         self.ph.memsz += diff
 
         # update trailing sections address to avoid overlap
-        # local_logger.debug("LOCAL:")
+        local_logger.debug("LOCAL:")
         for section in self.shlist:
-            # local_logger.debug(section)
+            local_logger.debug("%r", section)
 
             if section.sh.addr and section.addr > sec.addr:
-                # local_logger.debug(f"Offseting section {section}")
+                local_logger.debug("Offseting section %r", section)
                 section.sh.addr += diff
 
             if section.sh.offset > sec.sh.offset:
-                # local_logger.debug(f"\tadd {section.sh.offset:x} {diff}")
+                local_logger.debug("\tadd %x %x", section.sh.offset, diff)
                 section.sh.offset += diff
-                # local_logger.debug(f"\t{section.sh.offset:x}")
+                local_logger.debug("\t%x", section.sh.offset)
 
         performed_segment_expansion = False
 
         # TODO: remove hacky fix: self.ph.align > 0x30
         if align_to(old_size, self.ph.align) != align_to(new_size, self.ph.align) and self.ph.align > 0x30:
-            # local_logger.debug(f"{old_size=:x}|{align_to(old_size, self.ph.align):x}")
-            # local_logger.debug(f"{new_size=:x}|{align_to(new_size, self.ph.align):x}")
-            # local_logger.debug("Offseting subsequent segments after {self.shlist}")
+            local_logger.debug("old_size=%x|%x", old_size, align_to(old_size, self.ph.align))
+            local_logger.debug("new_size=%x|%x", new_size, align_to(new_size, self.ph.align))
+            local_logger.debug("Offseting subsequent segments after %r", self.shlist)
             segment_diff = align_to(new_size, self.ph.align) - align_to(old_size, self.ph.align)
             self.parent.move_after(sec, segment_diff, sec.sh.size - diff)
             performed_segment_expansion = True
@@ -903,20 +895,21 @@ class ProgramHeader(object):
             assert not sec.sh.offset < section.sh.offset < sec.sh.offset + sec.size - diff
 
         if performed_segment_expansion:
+            local_logger.debug("Segment resize: DONE")
             return
 
         self.parent.parent.Ehdr.shoff += diff
         
 
-        # local_logger.debug("GLOBAL:")
+        local_logger.debug("GLOBAL:")
         for section in self.parent.parent.sh:
-            # local_logger.debug(section)
+            local_logger.debug("%r", section)
             if section.phparent:
-                # local_logger.debug("\tskiping")
+                local_logger.debug("\tskiping")
                 continue
 
             if self.ph.offset < section.sh.offset:
-                # local_logger.debug(f"\toffseting {diff:x}")
+                local_logger.debug("\toffseting %x", diff)
                 section.move(diff)
 
     # get_rvaitem needs addr and size (same names as in the Shdr class)
@@ -963,17 +956,17 @@ class PHList(object):
             c += p.ph.pack()
         return c
     def move_after(self, sec, diff, old_section_size):
-        # local_logger = logging.getLogger("expand_sections")
+        local_logger = logging.getLogger("expand_sections")
         # local_logger.setLevel(logging.DEBUG)
 
         # this is called by a ProgramHeader after a Section has beed resized
-        # old_section_size = sec.sh.size - diff
-        # local_logger.debug(f"{hex(old_section_size)} = {hex(sec.sh.size)} - {hex(diff)}")
+        old_section_size = sec.sh.size - diff
+        local_logger.debug("%x = %x - %x", old_section_size, sec.sh.size, diff)
 
         old_section_file_end = sec.sh.offset + old_section_size
         old_section_memory_end = sec.sh.addr + old_section_size
-        # local_logger.debug("old_section_memory_end = sec.sh.addr + old_section_size")
-        # local_logger.debug(f"{hex(old_section_memory_end)} = {hex(sec.sh.addr)} + {hex(old_section_size)}")
+        local_logger.debug("old_section_memory_end = sec.sh.addr + old_section_size")
+        local_logger.debug("%x = %x - %x", old_section_memory_end, sec.sh.addr, old_section_size)
 
         for p in self.phlist:
             # address changes are requiered ONLY if the previous segment overflows in to it
