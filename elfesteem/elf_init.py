@@ -736,17 +736,9 @@ class SHList(object):
                 % (len(self.shlist), self.parent.Ehdr.shoff),
                 "",
                 "Section Headers:" ]
-        if self.wsize == 32:
-            rep.append( "  [Nr] Name              Type            Addr     Off    Size   ES Flg Lk Inf Al" )
-        elif self.wsize == 64:
-            rep.extend(["  [Nr] Name              Type             Address           Offset    Size              EntSize          Flags  Link  Info  Align"])
+        rep.extend({32: elf.Shdr.header32, 64: elf.Shdr.header64}[self.wsize])
         rep.extend([ _.sh.readelf_display() for _ in self ])
-        rep.extend([ # Footer
-"Key to Flags:",
-"  W (write), A (alloc), X (execute), M (merge), S (strings)",
-"  I (info), L (link order), G (group), T (TLS), E (exclude), x (unknown)",
-"  O (extra OS processing required) o (OS specific), p (processor specific)",
-            ])
+        rep.extend(self[0].sh.footer)
         return "\n".join(rep)
     def __str__(self):
         raise AttributeError("Use pack() instead of str()")

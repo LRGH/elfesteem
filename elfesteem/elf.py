@@ -40,10 +40,24 @@ class Shdr(CStructWithStrTable):
                 ("addralign","ptr"),
                 ("entsize","ptr") ]
     strtab = property(lambda _: _.parent.shstrtab)
-    format = property(lambda _: {
-        32: "  [%(idx)2d] %(name17)-17s %(type_txt)-15s %(addr)08x %(offset)06x %(size)06x %(entsize)02x %(flags_txt)3s %(link)2d %(info)3d %(addralign)2d",
-        64: "  [%(idx)2d] %(name17)-17s %(type_txt)-15s  %(addr)016x  %(offset)08x  %(size)016x  %(entsize)016x %(flags_txt)3s      %(link)2d    %(info)2d    %(addralign)2d",
-        }[_.wsize])
+    header32 = ["  [Nr] Name              Type            Addr     Off    Size   ES Flg Lk Inf Al"]
+    format32 = "  [%(idx)2d] %(name17)-17s %(type_txt)-15s %(addr)08x %(offset)06x %(size)06x %(entsize)02x %(flags_txt)3s %(link)2d %(info)3d %(addralign)2d"
+    header64 = ["  [Nr] Name              Type             Address           Offset    Size              EntSize          Flags  Link  Info  Align"]
+    format64 = "  [%(idx)2d] %(name17)-17s %(type_txt)-15s  %(addr)016x  %(offset)08x  %(size)016x  %(entsize)016x %(flags_txt)3s      %(link)2d    %(info)2d    %(addralign)2d"
+    footer32 = [
+        "Key to Flags:",
+        "  W (write), A (alloc), X (execute), M (merge), S (strings)",
+        "  I (info), L (link order), G (group), T (TLS), E (exclude), x (unknown)",
+        "  O (extra OS processing required) o (OS specific), p (processor specific)",
+        ]
+    footer64 = [
+        "Key to Flags:",
+        "  W (write), A (alloc), X (execute), M (merge), S (strings), l (large)",
+        "  I (info), L (link order), G (group), T (TLS), E (exclude), x (unknown)",
+        "  O (extra OS processing required) o (OS specific), p (processor specific)",
+        ]
+    format = property(lambda _: { 32: Shdr.format32, 64: Shdr.format64 }[_.wsize])
+    footer = property(lambda _: { 32: Shdr.footer32, 64: Shdr.footer64 }[_.wsize])
     name17 = property(lambda _: _.name[:17])
     idx = property(lambda _: _.parent.parent.shlist.index(_.parent))
     def flags_txt(self):
@@ -164,7 +178,7 @@ class RelBase(CStruct):
         if self.sym == '':
             return self.parent.parent.parent.sh[self.shndx].sh.name
         else:
-            return self.sym
+            return self.sym[:22]
     name = property(name)
     def type17(self):
         machine = constants['EM'][self.parent.parent.parent.Ehdr.machine]
@@ -176,12 +190,23 @@ class RelBase(CStruct):
             ret = 'R_%s_%s' % (machine, constants['R'][machine][self.type1])
         else:
             ret = 'R_%s_%s' % (machine, constants['R'][machine][self.type])
-        return ret[:17] # truncated by readelf!
+        ret = ret[:17] # truncated by readelf!
+        if ret == 'R_386_JMP_SLOT': ret = 'R_386_JUMP_SLOT' 
+        return ret
     type17 = property(type17)
     def readelf_display(self):
         res = self.format % self
+        if self.__class__.__name__ == 'Rel32':
+            res += ' %(value)08x  ' % self
+        else:
+            if self.value == 0 and self.type == R_X86_64_RELATIVE:
+                res += '                  '
+            else:
+                res += ' %(value)016x' % self
+        res += ' %(name)s' % self
         if self.parent.sht == SHT_RELA:
             if self.addend < 0: res += " - %x" % -self.addend
+            elif self.name == '': res += " %x" %  self.addend
             else:               res += " + %x" %  self.addend
         if hasattr(self, 'type1'):
             machine = constants['EM'][self.parent.parent.parent.Ehdr.machine]
@@ -197,6 +222,7 @@ class Rel32(RelBase):
     _fields = [ ("offset","ptr"),
                 ("info","u32") ]
     format = '%(offset)08x  %(info)08x %(type17)-17s %(value)08x   %(name)s'
+    format = '%(offset)08x  %(info)08x %(type17)-17s'
     type = property(lambda _: _.info & 0xff)
     sym_idx = property(lambda _:_.info>>8)
 
@@ -204,6 +230,7 @@ class Rel64(RelBase):
     _fields = [ ("offset","ptr"),
                 ("info","u64") ]
     format = '%(offset)012x  %(info)012x %(type17)-17s %(value)016x %(name)s'
+    format = '%(offset)012x  %(info)012x %(type17)-17s'
     type = property(lambda _: _.info & mask32)
     sym_idx = property(lambda _:_.info>>32)
 
@@ -351,6 +378,27 @@ SetConstants(
 ELFDATANONE =   0,       # Invalid data encoding
 ELFDATA2LSB =   1,       # Least significant byte at lowest address
 ELFDATA2MSB =   2,       # Most significant byte at lowest address
+)
+
+SetConstants(
+# Legal values for e_ident[EI_OSABI]
+ELFOSABI_NONE =         0,      # UNIX System V ABI
+ELFOSABI_SYSV =         0,      # Alias
+ELFOSABI_HPUX =         1,      # HP-UX
+ELFOSABI_NETBSD =       2,      # NetBSD
+ELFOSABI_GNU =          3,      # Object uses GNU ELF extensions
+ELFOSABI_LINUX =        3,      # Compatibility alias
+ELFOSABI_SOLARIS =      6,      # Sun Solaris
+ELFOSABI_AIX =          7,      # IBM AIX
+ELFOSABI_IRIX =         8,      # SGI Irix
+ELFOSABI_FREEBSD =      9,      # FreeBSD
+ELFOSABI_TRU64 =        10,     # Compaq TRU64 UNIX
+ELFOSABI_MODESTO =      11,     # Novell Modesto
+ELFOSABI_OPENBSD =      12,     # OpenBSD
+ELFOSABI_ARM_AEABI =    64,     # ARM EABI
+ELFOSABI_ARM =          97,     # ARM
+ELFOSABI_STANDALONE =   255,    # Standalone (embedded) application
+no_name=('ELFOSABI_SYSV','ELFOSABI_LINUX'),
 )
 
 SetConstants(

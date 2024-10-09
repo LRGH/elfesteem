@@ -8,6 +8,26 @@ if sys.version_info[0] == 2 and sys.version_info[1] < 5:
 sys.path.insert(1, os.path.abspath(sys.path[0]+'/..'))
 from elfesteem import elf_init, elf
 
+import subprocess
+def popen_read_out_err(cmd):
+    p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    p.wait()
+    p.stdin.close()
+    return p.stdout.read() + p.stderr.read()
+
+import re
+def get_readelf_version():
+    readelf_v = popen_read_out_err(["readelf", "--version"])
+    if type(readelf_v) != str: readelf_v = str(readelf_v, encoding='latin1')
+    r = re.search(r'GNU readelf .* (\d+\.\d+)', readelf_v)
+    if r:
+        sys.stderr.write("readelf version %s\n" % float(r.groups()[0]))
+        return float(r.groups()[0])
+    else:
+        sys.stderr.write("Could not detect readelf version\n")
+        sys.stderr.write(readelf_v)
+        return None
+
 et_strings = {
     elf.ET_REL: 'REL (Relocatable file)',
     elf.ET_EXEC: 'EXEC (Executable file)',
@@ -18,11 +38,26 @@ def expand_code(table, val):
     if val in table: return table[val]
     return '<unknown>: %#x' % val
 
+def is_pie(e):
+    # binutils 2.37
+    # 2021-06-15 https://github.com/bminor/binutils-gdb/commit/93df3340fd5ad32f784214fc125de71811da72ff
+    for i, sh in enumerate(e.sh):
+        if sh.sh.type != elf.SHT_DYNAMIC:
+            continue
+        if e.wsize == 32:
+            dyntab = sh.dyntab[:-2]
+        elif e.wsize == 64:
+            dyntab = sh.dyntab[:-1]
+        for d in dyntab:
+            if d.type == elf.DT_FLAGS_1 and d.name & elf.DF_1_PIE:
+                return True
+    return False
+
 def display_headers(e):
     print("ELF Header:")
     import struct
     ident = struct.unpack('16B', e.Ehdr.ident)
-    print("  Magic:   %s"%' '.join(['%02x'%_ for _ in ident]))
+    print("  Magic:   %s "%' '.join(['%02x'%_ for _ in ident]))
     print("  Class:                             %s"%expand_code({
         elf.ELFCLASS32: 'ELF32',
         elf.ELFCLASS64: 'ELF64',
@@ -38,7 +73,10 @@ def display_headers(e):
         0: 'UNIX - System V',
         }, ident[elf.EI_OSABI]))
     print("  ABI Version:                       %d"%ident[elf.EI_ABIVERSION])
-    print("  Type:                              %s"%expand_code(et_strings, e.Ehdr.type))
+    elf_file_type = expand_code(et_strings, e.Ehdr.type)
+    if e.Ehdr.type == elf.ET_DYN and elf.is_pie(e):
+        elf_file_type = 'DYN (Position-Independent Executable file)'
+    print("  Type:                              %s"%elf_file_type)
     machine_code = dict(elf.constants['EM'])
     # Same textual output as readelf, from readelf.c
     machine_code[elf.EM_M32]            = 'ME32100'
@@ -72,21 +110,19 @@ def display_headers(e):
     machine_code[elf.EM_IA_64]          = 'Intel IA-64'
     machine_code[elf.EM_MIPS_X]         = 'Stanford MIPS-X'
     machine_code[elf.EM_COLDFIRE]       = 'Motorola Coldfire'
+    machine_code[elf.EM_X86_64]         = 'Advanced Micro Devices X86-64'
     print("  Machine:                           %s"%expand_code(machine_code, e.Ehdr.machine))
-    """
-    TO BE CONTINUED
-                ("version","u32"),
-                ("entry","ptr"),
-                ("phoff","ptr"),
-                ("shoff","ptr"),
-                ("flags","u32"),
-                ("ehsize","u16"),
-                ("phentsize","u16"),
-                ("phnum","u16"),
-                ("shentsize","u16"),
-                ("shnum","u16"),
-                ("shstrndx","u16") ]
-    """
+    print("  Version:                           %#x"%e.Ehdr.version)
+    print("  Entry point address:               %#x"%e.Ehdr.entry)
+    print("  Start of program headers:          %d (bytes into file)"%e.Ehdr.phoff)
+    print("  Start of section headers:          %d (bytes into file)"%e.Ehdr.shoff)
+    print("  Flags:                             %#x"%e.Ehdr.flags)
+    print("  Size of this header:               %d (bytes)"%e.Ehdr.ehsize)
+    print("  Size of program headers:           %d (bytes)"%e.Ehdr.phentsize)
+    print("  Number of program headers:         %d"%e.Ehdr.phnum)
+    print("  Size of section headers:           %d (bytes)"%e.Ehdr.shentsize)
+    print("  Number of section headers:         %d"%e.Ehdr.shnum)
+    print("  Section header string table index: %d"%e.Ehdr.shstrndx)
 
 def display_program_headers(e):
     # Output format similar to readelf -l
@@ -199,10 +235,85 @@ if __name__ == '__main__':
     parser.add_argument('-d', '--dynamic', dest='options', action='append_const', const='dynamic',  help='Display the dynamic section (if present)')
     parser.add_argument('-l', '--program-headers', '--segments', dest='options', action='append_const', const='program',  help='Display the program headers')
     parser.add_argument('-g', '--section-groups', dest='options', action='append_const', const='groups',   help='Display the section groups')
+    parser.add_argument('--readelf', dest='readelf_version', action='append', help='Simulate the output of a given version of readelf')
     parser.add_argument('file', nargs='+', help='ELF file(s)')
     args = parser.parse_args()
     if args.options is None:
         args.options = []
+
+    elf.is_pie = lambda _: False
+    if args.readelf_version:
+        for readelf in args.readelf_version:
+            if 'native' in readelf:
+                readelf_version = get_readelf_version()
+            else:
+                readelf_version = float(readelf)
+        if True:
+            # TODO: readelf has a different output if "do_section_details" or "do_wide"
+            elf.Shdr.header64 = ["  [Nr] Name              Type             Address           Offset",
+                                 "       Size              EntSize          Flags  Link  Info  Align"]
+            elf.Shdr.format64 = ("  [%(idx)2d] %(name17)-17s %(type_txt)-15s  %(addr)016x  %(offset)08x\n"
+                                 "       %(size)016x  %(entsize)016x %(flags_txt)3s      %(link)2d    %(info)2d     %(addralign)d")
+        if readelf_version >= 2.26:
+            # 2016-01-20 https://github.com/bminor/binutils-gdb/commit/9fb71ee49fc37163697e4f34e16097928eb83d66
+            elf.Shdr.footer = property(lambda _: [
+                "Key to Flags:",
+                "  W (write), A (alloc), X (execute), M (merge), S (strings), I (info),",
+                "  L (link order), O (extra OS processing required), G (group), T (TLS),",
+                "  C (compressed), x (unknown), o (OS specific), E (exclude),",
+                "  %sp (processor specific)" % (
+                    "l (large), " if e.Ehdr.machine in (elf.EM_X86_64, elf.EM_L10M, elf.EM_K10M) else
+                    "y (noread), " if e.Ehdr.machine == elf.EM_ARM else
+                    "" ),
+                ])
+        if readelf_version >= 2.27:
+            # 2016-07-05 https://github.com/bminor/binutils-gdb/commit/f0728ee368f217f2473798ad7ccfe9feae4412ce
+            elf.Shdr.footer = property(lambda _: [
+                "Key to Flags:",
+                "  W (write), A (alloc), X (execute), M (merge), S (strings), I (info),",
+                "  L (link order), O (extra OS processing required), G (group), T (TLS),",
+                "  C (compressed), x (unknown), o (OS specific), E (exclude),",
+                "  %sp (processor specific)" % (
+                    "l (large), " if e.Ehdr.machine in (elf.EM_X86_64, elf.EM_L10M, elf.EM_K10M) else
+                    "y (purecode), " if e.Ehdr.machine == elf.EM_ARM else
+                    "" ),
+                ])
+        if readelf_version >= 2.29: # more precisely 2.29.1
+            # 2017-09-05 https://github.com/bminor/binutils-gdb/commit/83eef883581525d04df3a8e53a82c01d0d12b56a
+            elf.Shdr.footer = property(lambda _: [
+                "Key to Flags:",
+                "  W (write), A (alloc), X (execute), M (merge), S (strings), I (info),",
+                "  L (link order), O (extra OS processing required), G (group), T (TLS),",
+                "  C (compressed), x (unknown), o (OS specific), E (exclude),",
+                "  %sp (processor specific)" % (
+                    "l (large), " if e.Ehdr.machine in (elf.EM_X86_64, elf.EM_L10M, elf.EM_K10M) else
+                    "y (purecode), " if e.Ehdr.machine == elf.EM_ARM else
+                    "v (VLE), " if e.Ehdr.machine == elf.EM_PPC else
+                    "" ),
+                ])
+        if readelf_version >= 2.36: # more precisely 2.36.1
+            # 2021-02-02 https://github.com/bminor/binutils-gdb/commit/5424d7ed94cf5a7ca24636ab9f4e6d5c353fc0d3
+            elf.Shdr.footer = property(lambda _: [
+                "Key to Flags:",
+                "  W (write), A (alloc), X (execute), M (merge), S (strings), I (info),",
+                "  L (link order), O (extra OS processing required), G (group), T (TLS),",
+                "  C (compressed), x (unknown), o (OS specific), E (exclude),",
+                "  %s%sp (processor specific)" % (
+                    "R (retain), D (mbind), " if e.Ehdr.ident[elf.EI_OSABI] in (elf.ELFOSABI_GNU, elf.ELFOSABI_FREEBSD) else
+                    "D (mbind), " if e.Ehdr.ident[elf.EI_OSABI] == elf.ELFOSABI_NONE else
+                    ""
+                    ,
+                    "l (large), " if e.Ehdr.machine in (elf.EM_X86_64, elf.EM_L10M, elf.EM_K10M) else
+                    "y (noread), " if e.Ehdr.machine == elf.EM_ARM else
+                    "" ),
+                ])
+        if readelf_version >= 2.35:
+            # 2020-07-02 https://github.com/bminor/binutils-gdb/commit/0942c7ab94e554657c3e11ab85ae7f15373ee80d
+            elf.Shdr.name17 = property(lambda _: _.name[:12]+"[...]" if len(_.name) > 17 else _.name)
+        if readelf_version >= 2.37:
+            # 2021-06-15 https://github.com/bminor/binutils-gdb/commit/93df3340fd5ad32f784214fc125de71811da72ff
+            elf.is_pie = is_pie
+
 
     for file in args.file:
         if len(args.file) > 1:

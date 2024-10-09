@@ -161,7 +161,7 @@ def test_ELF_small64(assertion):
               'Packing after reading elf64_small.out')
     # Packed file is identical :-)
     d = e.sh.readelf_display().encode('latin1')
-    assertion('c497dd6a4e9aa54fb5f65ee3b8f9de3e',
+    assertion('0454c8b5354b3eda58fce252d5d48621',
               hashlib.md5(d).hexdigest(),
               'Display Section Headers (readelf, 64bit)')
     d = e.getsectionbyname('.symtab').readelf_display().encode('latin1')
